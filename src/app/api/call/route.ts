@@ -1,143 +1,93 @@
 import { NextRequest, NextResponse } from 'next/server';
 import prisma from '../../../lib/db';
-import twilio from 'twilio';
+import { makeVapiCall, formatPhoneNumber } from '../../../lib/vapi';
 
-const twilioClient = twilio(
-  process.env.TWILIO_ACCOUNT_SID || 'MISSING',
-  process.env.TWILIO_AUTH_TOKEN || 'MISSING'
-);
+const COST_PER_MINUTE = 0.05; // $0.05/min with BYOC (SignalWire + Cartesia via VAPI)
+const MIN_BALANCE = 1.0;
 
-
-
-
-const COST_PER_MINUTE = 0.15; // $0.15/min
-const MIN_BALANCE = 1.0; // minimum wallet balance to initiate a call
-
-// Smart phone number formatter — never blindly adds +1
-// Rules: already has '+' → use as-is | 10 digits starting 6-9 → India (+91) | else → add +1 fallback
-function formatPhoneNumber(raw: string): string {
-  // If it's a SIP URI, don't format it like a PSTN number
-  if (raw.toLowerCase().startsWith('sip:') || raw.includes('@')) {
-    return raw;
-  }
-
-  const cleaned = raw.replace(/[\s\-().]/g, ''); // strip spaces, dashes, parens, dots
-  if (cleaned.startsWith('+')) return cleaned;   // already has country code
-  // Indian mobile numbers: 10 digits starting with 6, 7, 8, or 9
-  if (/^[6-9]\d{9}$/.test(cleaned)) return `+91${cleaned}`;
-  // US 10-digit
-  if (/^\d{10}$/.test(cleaned)) return `+1${cleaned}`;
-  // 11 digits starting with 91 (India without +)
-  if (/^91[6-9]\d{9}$/.test(cleaned)) return `+${cleaned}`;
-  // 11 digits starting with 1 (US without +)
-  if (/^1\d{10}$/.test(cleaned)) return `+${cleaned}`;
-  // Fallback: just add + and hope for the best
-  return `+${cleaned}`;
-}
-
-// POST /api/call — initiate a voice call to a lead
+// POST /api/call — initiate a voice call to a lead via VAPI
 export async function POST(request: NextRequest) {
   try {
     const body = await request.json();
-    const { leadId } = body;
+    const { leadId, bulkLeadIds } = body;
 
-    if (!leadId) {
-      return NextResponse.json({ error: 'leadId is required' }, { status: 400 });
+    // Support bulk calling (from CSV/sheet)
+    const leadIds: string[] = bulkLeadIds || (leadId ? [leadId] : []);
+
+    if (leadIds.length === 0) {
+      return NextResponse.json({ error: 'leadId or bulkLeadIds is required' }, { status: 400 });
     }
 
-    const lead = await prisma.lead.findUnique({
-      where: { id: leadId },
-      include: { user: true },
-    });
+    const results: any[] = [];
 
-    if (!lead) {
-      return NextResponse.json({ error: 'Lead not found' }, { status: 404 });
-    }
-
-    // Skip SIP addresses - only real phone numbers can be called
-    if (lead.phone.includes('@')) {
-      return NextResponse.json({ error: 'Cannot call SIP addresses. Only phone numbers supported.' }, { status: 400 });
-    }
-
-    // Check wallet balance
-    if (lead.user.walletAmount < MIN_BALANCE) {
-      return NextResponse.json({
-        error: `Insufficient wallet balance. Current: $${lead.user.walletAmount.toFixed(2)}`,
-      }, { status: 402 });
-    }
-
-    // Create call record
-    const callRecord = await prisma.call.create({
-      data: {
-        leadId,
-        status: 'initiated',
-        duration: 0,
-        costDeducted: 0,
-      },
-    });
-
-    try {
-      const agentId = process.env.ELEVENLABS_AGENT_ID || '';
-
-      // FORCE Vercel URL so SignalWire can ALWAYS reach it (localhost won't work)
-      const twimlUrl = `https://voice-agent-jbl4.vercel.app/api/twiml?agent_id=${agentId}`;
-
-      let formattedPhone = formatPhoneNumber(lead.phone);
-      const provider = (process.env.CALL_PROVIDER || 'signalwire').toLowerCase();
-      let callSid = '';
-
-      if (provider === 'signalwire') {
-        // Direct REST API call to SignalWire (No SDK dependency)
-        const projectId = process.env.SIGNALWIRE_PROJECT_ID;
-        const apiToken = process.env.SIGNALWIRE_API_TOKEN;
-        const spaceUrl = process.env.SIGNALWIRE_SPACE_URL;
-        
-        const auth = Buffer.from(`${projectId}:${apiToken}`).toString('base64');
-        const restUrl = `https://${spaceUrl}/api/laml/2010-04-01/Accounts/${projectId}/Calls`;
-
-        const swRes = await fetch(restUrl, {
-          method: 'POST',
-          headers: {
-            'Authorization': `Basic ${auth}`,
-            'Content-Type': 'application/x-www-form-urlencoded',
-          },
-          body: new URLSearchParams({
-            From: process.env.SIGNALWIRE_PHONE_NUMBER!,
-            To: formattedPhone,
-            Url: twimlUrl,
-          }),
+    for (const id of leadIds) {
+      try {
+        const lead = await prisma.lead.findUnique({
+          where: { id },
+          include: { user: true },
         });
 
-        if (!swRes.ok) {
-          const swError = await swRes.text();
-          throw new Error(`SignalWire API Error: ${swError}`);
+        if (!lead) {
+          results.push({ leadId: id, error: 'Lead not found' });
+          continue;
         }
 
-        const swData: any = await swRes.json();
-        callSid = swData.sid;
-      } else {
-        const call = await twilioClient.calls.create({
-          from: process.env.TWILIO_PHONE_NUMBER!,
-          to: formattedPhone,
-          url: twimlUrl,
-          method: 'POST',
+        // Skip SIP addresses
+        if (lead.phone.includes('@')) {
+          results.push({ leadId: id, error: 'SIP addresses not supported' });
+          continue;
+        }
+
+        // Check wallet balance
+        if (lead.user.walletAmount < MIN_BALANCE) {
+          results.push({ leadId: id, error: `Insufficient balance: $${lead.user.walletAmount.toFixed(2)}` });
+          continue;
+        }
+
+        // Create call record
+        const callRecord = await prisma.call.create({
+          data: { leadId: id, status: 'initiated', duration: 0, costDeducted: 0 },
         });
-        callSid = call.sid;
+
+        // Update lead status
+        await prisma.lead.update({
+          where: { id },
+          data: { status: 'calling' },
+        });
+
+        const formattedPhone = formatPhoneNumber(lead.phone);
+
+        // Call via VAPI (SignalWire + Cartesia configured in VAPI dashboard)
+        const vapiResult = await makeVapiCall({
+          customerPhone: formattedPhone,
+          customerName: lead.name,
+          assistantOverrides: lead.user.script ? {
+            firstMessage: `Hi ${lead.name}, ${lead.user.script.substring(0, 100)}`,
+          } : undefined,
+        });
+
+        // Save VAPI call ID
+        await prisma.call.update({
+          where: { id: callRecord.id },
+          data: { status: `vapi:${vapiResult.id}` },
+        });
+
+        results.push({ leadId: id, success: true, vapiCallId: vapiResult.id });
+      } catch (innerError: any) {
+        console.error(`Call error for lead ${id}:`, innerError);
+        await prisma.lead.update({ where: { id }, data: { status: 'failed' } }).catch(() => {});
+        results.push({ leadId: id, error: innerError.message });
       }
-
-      await prisma.call.update({
-        where: { id: callRecord.id },
-        data: { status: `${provider}:${callSid}` },
-      });
-
-      return NextResponse.json({ success: true, callSid });
-    } catch (innerError: any) {
-      console.error('Telephony Inner Error:', innerError);
-      // Revert status on inner failure
-      await prisma.lead.update({ where: { id: leadId }, data: { status: 'failed' } });
-      return NextResponse.json({ error: `Telephony Error: ${innerError.message}` }, { status: 500 });
     }
 
+    // Single call response vs bulk
+    if (!bulkLeadIds && results.length === 1) {
+      const r = results[0];
+      if (r.error) return NextResponse.json({ error: r.error }, { status: 400 });
+      return NextResponse.json({ success: true, vapiCallId: r.vapiCallId });
+    }
+
+    return NextResponse.json({ results });
   } catch (error: any) {
     console.error('CRITICAL CALL API ERROR:', error);
     return NextResponse.json({ error: `System Error: ${error.message}` }, { status: 500 });
